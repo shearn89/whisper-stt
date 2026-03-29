@@ -12,6 +12,7 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"flag"
 	"fmt"
 	"math"
@@ -36,11 +37,41 @@ const (
 )
 
 // ---------------------------------------------------------------------------
+// Swappable dependencies — replaced by tests to avoid real system calls
+// ---------------------------------------------------------------------------
+
+// newCmd creates an *exec.Cmd. Tests replace this to intercept subprocess calls.
+var newCmd = exec.Command
+
+// lookPath checks for a binary on PATH. Tests replace this to control availability.
+var lookPath = exec.LookPath
+
+// clipboardWrite writes text to the system clipboard. Tests replace this to
+// capture output without touching the real clipboard.
+var clipboardWrite = clipboard.WriteAll
+
+// paDevices returns available PortAudio devices. Tests replace this to avoid
+// needing real audio hardware.
+var paDevices = portaudio.Devices
+
+// audioStream is the minimal interface required from a PortAudio stream.
+// *portaudio.Stream satisfies it; tests use fakeStream.
+type audioStream interface {
+	Start() error
+	Stop() error
+	Close() error
+}
+
+// newAudioStream opens an audio input stream. Tests replace this with a no-op.
+var newAudioStream = realOpenAudioStream
+
+// ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
 
-// config holds all runtime settings.  Fields are exported so the TOML decoder
-// can populate them; toml tags match the snake_case keys in config.toml.
+// config holds all runtime settings. Exported fields are populated by the TOML
+// decoder; toml tags use snake_case. The unexported listDevices field is an
+// internal CLI flag that is not written to config files.
 type config struct {
 	Model      string `toml:"model"`
 	WhisperBin string `toml:"whisper_bin"`
@@ -50,6 +81,8 @@ type config struct {
 	SendEnter  bool   `toml:"send_enter"`
 	Language   string `toml:"language"`
 	Device     int    `toml:"device"`
+
+	listDevices bool // --list-devices flag, not persisted to TOML
 }
 
 func defaultConfig() *config {
@@ -71,63 +104,86 @@ func defaultConfigPath() string {
 }
 
 // loadConfig builds a config by layering: defaults → config file → CLI flags.
-func loadConfig() *config {
+// It accepts the raw argument slice so callers (and tests) can supply any args
+// without touching os.Args. It uses a fresh FlagSet so it is safe to call
+// multiple times (e.g. in tests).
+func loadConfig(args []string) (*config, error) {
 	cfg := defaultConfig()
 
-	// Pre-scan argv to find --config before flag.Parse so we know which file
-	// to load before registering flag defaults.
+	// Pre-scan args to find --config before we register flag defaults so we
+	// know which file to load first.
 	configPath := defaultConfigPath()
-	for i, arg := range os.Args[1:] {
+	for i, arg := range args {
 		switch {
 		case strings.HasPrefix(arg, "--config="):
 			configPath = strings.TrimPrefix(arg, "--config=")
-		case arg == "--config" && i+2 < len(os.Args):
-			configPath = os.Args[i+2]
+		case arg == "--config" && i+1 < len(args):
+			configPath = args[i+1]
 		}
 	}
 
-	// Load TOML config file; missing file is fine, any other error is fatal.
+	// Load TOML config file. A missing file is not an error; any other I/O or
+	// parse error is.
 	if raw, err := os.ReadFile(configPath); err == nil {
 		if _, err := toml.Decode(string(raw), cfg); err != nil {
-			fmt.Fprintf(os.Stderr, "Config parse error (%s): %v\n", configPath, err)
-			os.Exit(1)
+			return nil, fmt.Errorf("config parse error (%s): %w", configPath, err)
 		}
-	} else if !os.IsNotExist(err) {
-		fmt.Fprintf(os.Stderr, "Config read error (%s): %v\n", configPath, err)
-		os.Exit(1)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("config read error (%s): %w", configPath, err)
 	}
 
-	// Register CLI flags using loaded config values as their defaults so that
-	// an explicit flag always wins over the config file.
-	flag.StringVar(&cfg.Model, "model", cfg.Model,
+	// Register CLI flags using loaded config values as defaults so that an
+	// explicit flag always wins over the config file.
+	fs := flag.NewFlagSet("whisper-stt", flag.ContinueOnError)
+	fs.StringVar(&cfg.Model, "model", cfg.Model,
 		"Whisper model size: tiny, base, small, medium, large")
-	flag.StringVar(&cfg.WhisperBin, "whisper-bin", cfg.WhisperBin,
+	fs.StringVar(&cfg.WhisperBin, "whisper-bin", cfg.WhisperBin,
 		"Path to whisper binary (openai-whisper CLI or whisper.cpp whisper-cli)")
-	flag.StringVar(&cfg.Hotkey, "hotkey", cfg.Hotkey,
+	fs.StringVar(&cfg.Hotkey, "hotkey", cfg.Hotkey,
 		"Key combo to trigger recording (pynput syntax: <ctrl>+<alt>+r)")
-	flag.StringVar(&cfg.Trigger, "trigger", cfg.Trigger,
+	fs.StringVar(&cfg.Trigger, "trigger", cfg.Trigger,
 		"Trigger mode: 'hold' = record while keys held; 'toggle' = press once to start, again to stop")
-	flag.BoolVar(&cfg.TypeDirect, "type-direct", cfg.TypeDirect,
+	fs.BoolVar(&cfg.TypeDirect, "type-direct", cfg.TypeDirect,
 		"Type text into focused window instead of copying to clipboard (requires xdotool)")
-	flag.BoolVar(&cfg.SendEnter, "send-enter", cfg.SendEnter,
+	fs.BoolVar(&cfg.SendEnter, "send-enter", cfg.SendEnter,
 		"Press Enter after delivering the text")
-	flag.StringVar(&cfg.Language, "language", cfg.Language,
+	fs.StringVar(&cfg.Language, "language", cfg.Language,
 		"Force Whisper to decode in this language (e.g. 'en'). Auto-detect if empty.")
-	flag.IntVar(&cfg.Device, "device", cfg.Device,
+	fs.IntVar(&cfg.Device, "device", cfg.Device,
 		"PortAudio input device index. Run --list-devices to list. -1 = default.")
-
-	flag.String("config", configPath,
+	fs.String("config", configPath,
 		"Path to TOML config file (default: ~/.config/whisper-stt/config.toml)")
-	listDevices := flag.Bool("list-devices", false,
+	fs.BoolVar(&cfg.listDevices, "list-devices", false,
 		"List available audio input devices and exit")
 
-	flag.Parse()
-
-	if *listDevices {
-		mustListDevices()
-		os.Exit(0)
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			os.Exit(0)
+		}
+		return nil, err
 	}
-	return cfg
+	return cfg, nil
+}
+
+// ---------------------------------------------------------------------------
+// Device listing
+// ---------------------------------------------------------------------------
+
+// listDevices returns a formatted string of available audio input devices.
+// It uses paDevices so tests can inject a fake device list.
+func listDevices() (string, error) {
+	devices, err := paDevices()
+	if err != nil {
+		return "", err
+	}
+	var sb strings.Builder
+	sb.WriteString("Available input devices:\n")
+	for i, d := range devices {
+		if d.MaxInputChannels > 0 {
+			fmt.Fprintf(&sb, "  [%d] %s\n", i, d.Name)
+		}
+	}
+	return sb.String(), nil
 }
 
 func mustListDevices() {
@@ -136,17 +192,12 @@ func mustListDevices() {
 		os.Exit(1)
 	}
 	defer portaudio.Terminate()
-	devices, err := portaudio.Devices()
+	out, err := listDevices()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "List devices: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Println("Available input devices:")
-	for i, d := range devices {
-		if d.MaxInputChannels > 0 {
-			fmt.Printf("  [%d] %s\n", i, d.Name)
-		}
-	}
+	fmt.Print(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -211,17 +262,17 @@ func writeWAV(f *os.File, samples []float32, rate int) error {
 	write16 := func(v uint16) { binary.Write(f, binary.LittleEndian, v) } //nolint:errcheck
 	write32 := func(v uint32) { binary.Write(f, binary.LittleEndian, v) } //nolint:errcheck
 
-	f.WriteString("RIFF")      //nolint:errcheck
-	write32(36 + dataSize)     // chunk size
-	f.WriteString("WAVEfmt ")  //nolint:errcheck
-	write32(16)                // subchunk1 size (PCM)
-	write16(1)                 // audio format: PCM
-	write16(1)                 // channels: mono
-	write32(uint32(rate))      // sample rate
-	write32(uint32(rate * 2))  // byte rate
-	write16(2)                 // block align
-	write16(16)                // bits per sample
-	f.WriteString("data")      //nolint:errcheck
+	f.WriteString("RIFF")     //nolint:errcheck
+	write32(36 + dataSize)    // chunk size
+	f.WriteString("WAVEfmt ") //nolint:errcheck
+	write32(16)               // subchunk1 size (PCM)
+	write16(1)                // audio format: PCM
+	write16(1)                // channels: mono
+	write32(uint32(rate))     // sample rate
+	write32(uint32(rate * 2)) // byte rate
+	write16(2)                // block align
+	write16(16)               // bits per sample
+	f.WriteString("data")     //nolint:errcheck
 	write32(dataSize)
 
 	for _, s := range samples {
@@ -274,7 +325,7 @@ func transcribe(samples []float32, cfg *config) (string, error) {
 	}
 
 	var stderr bytes.Buffer
-	cmd := exec.Command(cfg.WhisperBin, args...)
+	cmd := newCmd(cfg.WhisperBin, args...)
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
 		return "", fmt.Errorf("whisper exited: %w\nstderr: %s", err, stderr.String())
@@ -316,7 +367,7 @@ func deliverText(text string, cfg *config) {
 	if cfg.SendEnter {
 		out += "\n"
 	}
-	if err := clipboard.WriteAll(out); err != nil {
+	if err := clipboardWrite(out); err != nil {
 		fmt.Fprintf(os.Stderr, "Clipboard error: %v\n", err)
 		return
 	}
@@ -324,15 +375,15 @@ func deliverText(text string, cfg *config) {
 }
 
 func typeText(text string, cfg *config) {
-	if _, err := exec.LookPath("xdotool"); err != nil {
+	if _, err := lookPath("xdotool"); err != nil {
 		fmt.Fprintln(os.Stderr, "❌  xdotool not found. Install: sudo apt install xdotool")
-		clipboard.WriteAll(text) //nolint:errcheck
+		clipboardWrite(text) //nolint:errcheck
 		fmt.Println("📋  Fell back to clipboard.")
 		return
 	}
-	exec.Command("xdotool", "type", "--clearmodifiers", "--", text).Run() //nolint:errcheck
+	newCmd("xdotool", "type", "--clearmodifiers", "--", text).Run() //nolint:errcheck
 	if cfg.SendEnter {
-		exec.Command("xdotool", "key", "Return").Run() //nolint:errcheck
+		newCmd("xdotool", "key", "Return").Run() //nolint:errcheck
 	}
 	fmt.Println("⌨️  Typed into active window.")
 }
@@ -448,11 +499,12 @@ func runToggleListener(rec *recorder, cfg *config, keys []string) {
 // Audio stream
 // ---------------------------------------------------------------------------
 
-func openAudioStream(rec *recorder, cfg *config) (*portaudio.Stream, error) {
+// realOpenAudioStream is the live implementation of newAudioStream.
+func realOpenAudioStream(rec *recorder, cfg *config) (audioStream, error) {
 	callback := func(in []float32) { rec.append(in) }
 
 	if cfg.Device >= 0 {
-		devices, err := portaudio.Devices()
+		devices, err := paDevices()
 		if err != nil {
 			return nil, fmt.Errorf("list devices: %w", err)
 		}
@@ -481,9 +533,18 @@ func openAudioStream(rec *recorder, cfg *config) (*portaudio.Stream, error) {
 // ---------------------------------------------------------------------------
 
 func main() {
-	cfg := loadConfig()
+	cfg, err := loadConfig(os.Args[1:])
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
 
-	if _, err := exec.LookPath(cfg.WhisperBin); err != nil {
+	if cfg.listDevices {
+		mustListDevices()
+		os.Exit(0)
+	}
+
+	if _, err := lookPath(cfg.WhisperBin); err != nil {
 		fmt.Fprintf(os.Stderr,
 			"Whisper binary %q not found on PATH. Install openai-whisper or set whisper_bin in config.\n",
 			cfg.WhisperBin)
@@ -499,7 +560,7 @@ func main() {
 
 	rec := &recorder{}
 
-	stream, err := openAudioStream(rec, cfg)
+	stream, err := newAudioStream(rec, cfg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Open audio stream: %v\n", err)
 		os.Exit(1)
