@@ -1,0 +1,23 @@
+[Unit]
+Description=Whisper speech-to-text hotkey daemon
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+# Adjust ExecStart path after 'uv run' — or use the full path to the venv entry-point.
+# Example with uv (recommended):
+# ExecStart=/usr/bin/env uv run --project %h/.config/whisper-stt whisper-stt --model base --hotkey "<ctrl>+<alt>+r"
+
+# Uncomment to type directly instead of clipboard:
+ExecStart=/usr/bin/env uv run --project /home/kazper/repos/claude-workspace/whisper-stt whisper-stt --type-direct --language en --hotkey '<alt_r>' --send-enter
+
+Restart=on-failure
+RestartSec=3
+
+# Inherit the user's display so pynput and xdotool can see the X session
+Environment=DISPLAY=:0
+# Wayland: set this too if on Wayland + XWayland
+# Environment=WAYLAND_DISPLAY=wayland-0
+
+[Install]
+WantedBy=graphical-session.target
