@@ -1,13 +1,12 @@
 // whisper-stt: Hold a hotkey to record, release to transcribe.
 //
-// Transcription is delegated to an external whisper binary (default: the
-// openai-whisper Python CLI, or whisper.cpp's whisper-cli).  Use --whisper-bin
-// to point at a custom binary.
+// Configuration is loaded from ~/.config/whisper-stt/config.toml by default.
+// All settings can be overridden with CLI flags.
 //
 // Requirements:
-//   - PortAudio development libraries (libportaudio-dev)
-//   - A whisper binary on PATH (or --whisper-bin pointing to one)
-//   - xdotool (optional, for --type-direct)
+//   - PortAudio development libraries (libportaudio-dev / portaudio19-dev)
+//   - A whisper binary on PATH (or whisper_bin in config / --whisper-bin flag)
+//   - xdotool (optional, for type_direct)
 package main
 
 import (
@@ -25,6 +24,7 @@ import (
 	"sync"
 	"syscall"
 
+	"github.com/BurntSushi/toml"
 	"github.com/atotto/clipboard"
 	"github.com/gordonklaus/portaudio"
 	hook "github.com/robotn/gohook"
@@ -39,37 +39,88 @@ const (
 // Config
 // ---------------------------------------------------------------------------
 
+// config holds all runtime settings.  Fields are exported so the TOML decoder
+// can populate them; toml tags match the snake_case keys in config.toml.
 type config struct {
-	model      string
-	whisperBin string
-	hotkey     string
-	trigger    string
-	typeDirect bool
-	sendEnter  bool
-	language   string
-	device     int
+	Model      string `toml:"model"`
+	WhisperBin string `toml:"whisper_bin"`
+	Hotkey     string `toml:"hotkey"`
+	Trigger    string `toml:"trigger"`
+	TypeDirect bool   `toml:"type_direct"`
+	SendEnter  bool   `toml:"send_enter"`
+	Language   string `toml:"language"`
+	Device     int    `toml:"device"`
 }
 
-func parseFlags() *config {
-	cfg := &config{}
-	flag.StringVar(&cfg.model, "model", "base",
+func defaultConfig() *config {
+	return &config{
+		Model:      "base",
+		WhisperBin: "whisper",
+		Hotkey:     "<ctrl>+<alt>+r",
+		Trigger:    "hold",
+		Device:     -1,
+	}
+}
+
+func defaultConfigPath() string {
+	base := os.Getenv("XDG_CONFIG_HOME")
+	if base == "" {
+		base = filepath.Join(os.Getenv("HOME"), ".config")
+	}
+	return filepath.Join(base, "whisper-stt", "config.toml")
+}
+
+// loadConfig builds a config by layering: defaults → config file → CLI flags.
+func loadConfig() *config {
+	cfg := defaultConfig()
+
+	// Pre-scan argv to find --config before flag.Parse so we know which file
+	// to load before registering flag defaults.
+	configPath := defaultConfigPath()
+	for i, arg := range os.Args[1:] {
+		switch {
+		case strings.HasPrefix(arg, "--config="):
+			configPath = strings.TrimPrefix(arg, "--config=")
+		case arg == "--config" && i+2 < len(os.Args):
+			configPath = os.Args[i+2]
+		}
+	}
+
+	// Load TOML config file; missing file is fine, any other error is fatal.
+	if raw, err := os.ReadFile(configPath); err == nil {
+		if _, err := toml.Decode(string(raw), cfg); err != nil {
+			fmt.Fprintf(os.Stderr, "Config parse error (%s): %v\n", configPath, err)
+			os.Exit(1)
+		}
+	} else if !os.IsNotExist(err) {
+		fmt.Fprintf(os.Stderr, "Config read error (%s): %v\n", configPath, err)
+		os.Exit(1)
+	}
+
+	// Register CLI flags using loaded config values as their defaults so that
+	// an explicit flag always wins over the config file.
+	flag.StringVar(&cfg.Model, "model", cfg.Model,
 		"Whisper model size: tiny, base, small, medium, large")
-	flag.StringVar(&cfg.whisperBin, "whisper-bin", "whisper",
+	flag.StringVar(&cfg.WhisperBin, "whisper-bin", cfg.WhisperBin,
 		"Path to whisper binary (openai-whisper CLI or whisper.cpp whisper-cli)")
-	flag.StringVar(&cfg.hotkey, "hotkey", "<ctrl>+<alt>+r",
+	flag.StringVar(&cfg.Hotkey, "hotkey", cfg.Hotkey,
 		"Key combo to trigger recording (pynput syntax: <ctrl>+<alt>+r)")
-	flag.StringVar(&cfg.trigger, "trigger", "hold",
+	flag.StringVar(&cfg.Trigger, "trigger", cfg.Trigger,
 		"Trigger mode: 'hold' = record while keys held; 'toggle' = press once to start, again to stop")
-	flag.BoolVar(&cfg.typeDirect, "type-direct", false,
+	flag.BoolVar(&cfg.TypeDirect, "type-direct", cfg.TypeDirect,
 		"Type text into focused window instead of copying to clipboard (requires xdotool)")
-	flag.BoolVar(&cfg.sendEnter, "send-enter", false,
+	flag.BoolVar(&cfg.SendEnter, "send-enter", cfg.SendEnter,
 		"Press Enter after delivering the text")
-	flag.StringVar(&cfg.language, "language", "",
+	flag.StringVar(&cfg.Language, "language", cfg.Language,
 		"Force Whisper to decode in this language (e.g. 'en'). Auto-detect if empty.")
-	flag.IntVar(&cfg.device, "device", -1,
-		"PortAudio input device index. Run with --list-devices to list. -1 = default.")
+	flag.IntVar(&cfg.Device, "device", cfg.Device,
+		"PortAudio input device index. Run --list-devices to list. -1 = default.")
+
+	flag.String("config", configPath,
+		"Path to TOML config file (default: ~/.config/whisper-stt/config.toml)")
 	listDevices := flag.Bool("list-devices", false,
 		"List available audio input devices and exit")
+
 	flag.Parse()
 
 	if *listDevices {
@@ -155,23 +206,22 @@ func (r *recorder) stopAndGet() ([]float32, bool) {
 
 // writeWAV writes float32 mono samples as a 16-bit PCM WAV file.
 func writeWAV(f *os.File, samples []float32, rate int) error {
-	numSamples := len(samples)
-	dataSize := uint32(numSamples * 2) // 16-bit = 2 bytes/sample
+	dataSize := uint32(len(samples) * 2) // 16-bit = 2 bytes/sample
 
 	write16 := func(v uint16) { binary.Write(f, binary.LittleEndian, v) } //nolint:errcheck
 	write32 := func(v uint32) { binary.Write(f, binary.LittleEndian, v) } //nolint:errcheck
 
-	f.WriteString("RIFF")       //nolint:errcheck
-	write32(36 + dataSize)      // chunk size
-	f.WriteString("WAVEfmt ")   //nolint:errcheck
-	write32(16)                 // subchunk1 size (PCM)
-	write16(1)                  // audio format: PCM
-	write16(1)                  // channels: mono
-	write32(uint32(rate))       // sample rate
-	write32(uint32(rate * 2))   // byte rate (rate * channels * bits/8)
-	write16(2)                  // block align
-	write16(16)                 // bits per sample
-	f.WriteString("data")       //nolint:errcheck
+	f.WriteString("RIFF")      //nolint:errcheck
+	write32(36 + dataSize)     // chunk size
+	f.WriteString("WAVEfmt ")  //nolint:errcheck
+	write32(16)                // subchunk1 size (PCM)
+	write16(1)                 // audio format: PCM
+	write16(1)                 // channels: mono
+	write32(uint32(rate))      // sample rate
+	write32(uint32(rate * 2))  // byte rate
+	write16(2)                 // block align
+	write16(16)                // bits per sample
+	f.WriteString("data")      //nolint:errcheck
 	write32(dataSize)
 
 	for _, s := range samples {
@@ -188,13 +238,12 @@ func writeWAV(f *os.File, samples []float32, rate int) error {
 // Transcription — delegates to an external whisper binary
 // ---------------------------------------------------------------------------
 
-// timestampRe strips leading "[HH:MM:SS.mmm --> HH:MM:SS.mmm]" from whisper output lines.
+// timestampRe strips leading "[HH:MM:SS.mmm --> HH:MM:SS.mmm]" from output lines.
 var timestampRe = regexp.MustCompile(`^\[[0-9:.,\s\->]+\]\s*`)
 
 // transcribe saves samples to a temp WAV, invokes the whisper binary,
 // and returns the transcribed text.
 func transcribe(samples []float32, cfg *config) (string, error) {
-	// Write temp WAV file
 	tmp, err := os.CreateTemp("", "whisper-stt-*.wav")
 	if err != nil {
 		return "", fmt.Errorf("create temp file: %w", err)
@@ -208,10 +257,6 @@ func transcribe(samples []float32, cfg *config) (string, error) {
 	}
 	tmp.Close()
 
-	// Build whisper command
-	// openai-whisper: whisper FILE --model base --language en --output_format txt --output_dir DIR
-	// whisper-cli:    whisper-cli -m model.bin -f FILE -l en
-	// We target openai-whisper CLI; adjust --whisper-bin for whisper.cpp.
 	outDir, err := os.MkdirTemp("", "whisper-stt-out-*")
 	if err != nil {
 		return "", fmt.Errorf("create output dir: %w", err)
@@ -220,16 +265,16 @@ func transcribe(samples []float32, cfg *config) (string, error) {
 
 	args := []string{
 		tmpPath,
-		"--model", cfg.model,
+		"--model", cfg.Model,
 		"--output_format", "txt",
 		"--output_dir", outDir,
 	}
-	if cfg.language != "" {
-		args = append(args, "--language", cfg.language)
+	if cfg.Language != "" {
+		args = append(args, "--language", cfg.Language)
 	}
 
 	var stderr bytes.Buffer
-	cmd := exec.Command(cfg.whisperBin, args...)
+	cmd := exec.Command(cfg.WhisperBin, args...)
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
 		return "", fmt.Errorf("whisper exited: %w\nstderr: %s", err, stderr.String())
@@ -237,17 +282,16 @@ func transcribe(samples []float32, cfg *config) (string, error) {
 
 	// openai-whisper creates <basename>.txt in outDir
 	base := strings.TrimSuffix(filepath.Base(tmpPath), ".wav")
-	txtPath := filepath.Join(outDir, base+".txt")
-	data, err := os.ReadFile(txtPath)
+	data, err := os.ReadFile(filepath.Join(outDir, base+".txt"))
 	if err != nil {
-		// Fall back to parsing stdout-style output (whisper.cpp may write directly)
+		// Fallback: parse timestamp-prefixed lines from stderr (whisper.cpp style)
 		return parseTimestampedLines(stderr.String()), nil
 	}
 	return strings.TrimSpace(string(data)), nil
 }
 
-// parseTimestampedLines extracts text from whisper timestamp-prefixed output lines.
-// Handles lines like: [00:00.000 --> 00:05.000]  Hello world.
+// parseTimestampedLines extracts text from lines like:
+// [00:00.000 --> 00:05.000]  Hello world.
 func parseTimestampedLines(output string) string {
 	var parts []string
 	for _, line := range strings.Split(output, "\n") {
@@ -264,12 +308,12 @@ func parseTimestampedLines(output string) string {
 // ---------------------------------------------------------------------------
 
 func deliverText(text string, cfg *config) {
-	if cfg.typeDirect {
+	if cfg.TypeDirect {
 		typeText(text, cfg)
 		return
 	}
 	out := text
-	if cfg.sendEnter {
+	if cfg.SendEnter {
 		out += "\n"
 	}
 	if err := clipboard.WriteAll(out); err != nil {
@@ -287,7 +331,7 @@ func typeText(text string, cfg *config) {
 		return
 	}
 	exec.Command("xdotool", "type", "--clearmodifiers", "--", text).Run() //nolint:errcheck
-	if cfg.sendEnter {
+	if cfg.SendEnter {
 		exec.Command("xdotool", "key", "Return").Run() //nolint:errcheck
 	}
 	fmt.Println("⌨️  Typed into active window.")
@@ -306,7 +350,6 @@ func parseComboKeys(combo string) []string {
 		p = strings.TrimSpace(p)
 		p = strings.Trim(p, "<>")
 		p = strings.ToLower(p)
-		// Normalise common aliases to the names gohook recognises.
 		switch p {
 		case "cmd", "win":
 			p = "super"
@@ -348,17 +391,15 @@ func handleSamples(samples []float32, cfg *config) {
 // runHoldListener starts recording when all combo keys are held and stops
 // (triggering transcription) when any of them is released.
 func runHoldListener(rec *recorder, cfg *config, keys []string) {
-	// Start recording on full combo press.
 	hook.Register(hook.KeyDown, keys, func(e hook.Event) {
 		if !rec.isActive() {
 			rec.start()
 		}
 	})
 
-	// Stop on release of any individual key in the combo.
 	// stopAndGet is atomic so only the first goroutine that wins does work.
 	for _, k := range keys {
-		k := k // capture loop variable
+		k := k
 		hook.Register(hook.KeyUp, []string{k}, func(e hook.Event) {
 			go func() {
 				samples, ok := rec.stopAndGet()
@@ -410,16 +451,16 @@ func runToggleListener(rec *recorder, cfg *config, keys []string) {
 func openAudioStream(rec *recorder, cfg *config) (*portaudio.Stream, error) {
 	callback := func(in []float32) { rec.append(in) }
 
-	if cfg.device >= 0 {
+	if cfg.Device >= 0 {
 		devices, err := portaudio.Devices()
 		if err != nil {
 			return nil, fmt.Errorf("list devices: %w", err)
 		}
-		if cfg.device >= len(devices) {
+		if cfg.Device >= len(devices) {
 			return nil, fmt.Errorf("device index %d out of range (have %d devices)",
-				cfg.device, len(devices))
+				cfg.Device, len(devices))
 		}
-		dev := devices[cfg.device]
+		dev := devices[cfg.Device]
 		params := portaudio.StreamParameters{
 			Input: portaudio.StreamDeviceParameters{
 				Device:   dev,
@@ -440,18 +481,16 @@ func openAudioStream(rec *recorder, cfg *config) (*portaudio.Stream, error) {
 // ---------------------------------------------------------------------------
 
 func main() {
-	cfg := parseFlags()
+	cfg := loadConfig()
 
-	// Validate whisper binary is reachable.
-	if _, err := exec.LookPath(cfg.whisperBin); err != nil {
+	if _, err := exec.LookPath(cfg.WhisperBin); err != nil {
 		fmt.Fprintf(os.Stderr,
-			"Whisper binary %q not found on PATH. Install openai-whisper or set --whisper-bin.\n",
-			cfg.whisperBin)
+			"Whisper binary %q not found on PATH. Install openai-whisper or set whisper_bin in config.\n",
+			cfg.WhisperBin)
 		os.Exit(1)
 	}
-	fmt.Printf("🔄  Using Whisper binary %q with model %q…\n", cfg.whisperBin, cfg.model)
+	fmt.Printf("🔄  Using Whisper binary %q with model %q…\n", cfg.WhisperBin, cfg.Model)
 
-	// Initialise PortAudio.
 	if err := portaudio.Initialize(); err != nil {
 		fmt.Fprintf(os.Stderr, "PortAudio init: %v\n", err)
 		os.Exit(1)
@@ -472,15 +511,15 @@ func main() {
 	defer stream.Stop()  //nolint:errcheck
 	defer stream.Close() //nolint:errcheck
 
-	keys := parseComboKeys(cfg.hotkey)
+	keys := parseComboKeys(cfg.Hotkey)
 	triggerLabel := "Hold"
-	if cfg.trigger == "toggle" {
+	if cfg.Trigger == "toggle" {
 		triggerLabel = "Toggle with"
 	}
-	fmt.Printf("👂  %s [%s] to record. Ctrl-C to quit.\n\n", triggerLabel, cfg.hotkey)
+	fmt.Printf("👂  %s [%s] to record. Ctrl-C to quit.\n\n", triggerLabel, cfg.Hotkey)
 
 	go func() {
-		if cfg.trigger == "toggle" {
+		if cfg.Trigger == "toggle" {
 			runToggleListener(rec, cfg, keys)
 		} else {
 			runHoldListener(rec, cfg, keys)
