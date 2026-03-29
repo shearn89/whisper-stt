@@ -1,0 +1,538 @@
+// whisper-stt: Hold a hotkey to record, release to transcribe.
+//
+// Configuration is loaded from ~/.config/whisper-stt/config.toml by default.
+// All settings can be overridden with CLI flags.
+//
+// Requirements:
+//   - PortAudio development libraries (libportaudio-dev / portaudio19-dev)
+//   - A whisper binary on PATH (or whisper_bin in config / --whisper-bin flag)
+//   - xdotool (optional, for type_direct)
+package main
+
+import (
+	"bytes"
+	"encoding/binary"
+	"errors"
+	"flag"
+	"fmt"
+	"math"
+	"os"
+	"os/exec"
+	"os/signal"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"sync"
+	"syscall"
+
+	"github.com/BurntSushi/toml"
+	"github.com/atotto/clipboard"
+	"github.com/gordonklaus/portaudio"
+)
+
+const (
+	sampleRate      = 16_000 // Whisper expects 16 kHz
+	framesPerBuffer = 1024
+)
+
+// ---------------------------------------------------------------------------
+// Swappable dependencies — replaced by tests to avoid real system calls
+// ---------------------------------------------------------------------------
+
+// newCmd creates an *exec.Cmd. Tests replace this to intercept subprocess calls.
+var newCmd = exec.Command
+
+// lookPath checks for a binary on PATH. Tests replace this to control availability.
+var lookPath = exec.LookPath
+
+// clipboardWrite writes text to the system clipboard. Tests replace this to
+// capture output without touching the real clipboard.
+var clipboardWrite = clipboard.WriteAll
+
+// paDevices returns available PortAudio devices. Tests replace this to avoid
+// needing real audio hardware.
+var paDevices = portaudio.Devices
+
+// audioStream is the minimal interface required from a PortAudio stream.
+// *portaudio.Stream satisfies it; tests use fakeStream.
+type audioStream interface {
+	Start() error
+	Stop() error
+	Close() error
+}
+
+// newAudioStream opens an audio input stream. Tests replace this with a no-op.
+var newAudioStream = realOpenAudioStream
+
+// ---------------------------------------------------------------------------
+// Config
+// ---------------------------------------------------------------------------
+
+// config holds all runtime settings. Exported fields are populated by the TOML
+// decoder; toml tags use snake_case. The unexported listDevices field is an
+// internal CLI flag that is not written to config files.
+type config struct {
+	Model      string `toml:"model"`
+	WhisperBin string `toml:"whisper_bin"`
+	Hotkey     string `toml:"hotkey"`
+	Trigger    string `toml:"trigger"`
+	TypeDirect bool   `toml:"type_direct"`
+	SendEnter  bool   `toml:"send_enter"`
+	Language   string `toml:"language"`
+	Device     int    `toml:"device"`
+
+	listDevices bool // --list-devices flag, not persisted to TOML
+}
+
+func defaultConfig() *config {
+	return &config{
+		Model:      "base",
+		WhisperBin: "whisper",
+		Hotkey:     "<ctrl>+<alt>+r",
+		Trigger:    "hold",
+		Device:     -1,
+	}
+}
+
+func defaultConfigPath() string {
+	base := os.Getenv("XDG_CONFIG_HOME")
+	if base == "" {
+		base = filepath.Join(os.Getenv("HOME"), ".config")
+	}
+	return filepath.Join(base, "whisper-stt", "config.toml")
+}
+
+// loadConfig builds a config by layering: defaults → config file → CLI flags.
+// It accepts the raw argument slice so callers (and tests) can supply any args
+// without touching os.Args. It uses a fresh FlagSet so it is safe to call
+// multiple times (e.g. in tests).
+func loadConfig(args []string) (*config, error) {
+	cfg := defaultConfig()
+
+	// Pre-scan args to find --config before we register flag defaults so we
+	// know which file to load first.
+	configPath := defaultConfigPath()
+	for i, arg := range args {
+		switch {
+		case strings.HasPrefix(arg, "--config="):
+			configPath = strings.TrimPrefix(arg, "--config=")
+		case arg == "--config" && i+1 < len(args):
+			configPath = args[i+1]
+		}
+	}
+
+	// Load TOML config file. A missing file is not an error; any other I/O or
+	// parse error is.
+	if raw, err := os.ReadFile(configPath); err == nil {
+		if _, err := toml.Decode(string(raw), cfg); err != nil {
+			return nil, fmt.Errorf("config parse error (%s): %w", configPath, err)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("config read error (%s): %w", configPath, err)
+	}
+
+	// Register CLI flags using loaded config values as defaults so that an
+	// explicit flag always wins over the config file.
+	fs := flag.NewFlagSet("whisper-stt", flag.ContinueOnError)
+	fs.StringVar(&cfg.Model, "model", cfg.Model,
+		"Whisper model size: tiny, base, small, medium, large")
+	fs.StringVar(&cfg.WhisperBin, "whisper-bin", cfg.WhisperBin,
+		"Path to whisper binary (openai-whisper CLI or whisper.cpp whisper-cli)")
+	fs.StringVar(&cfg.Hotkey, "hotkey", cfg.Hotkey,
+		"Key combo to trigger recording (pynput syntax: <ctrl>+<alt>+r)")
+	fs.StringVar(&cfg.Trigger, "trigger", cfg.Trigger,
+		"Trigger mode: 'hold' = record while keys held; 'toggle' = press once to start, again to stop")
+	fs.BoolVar(&cfg.TypeDirect, "type-direct", cfg.TypeDirect,
+		"Type text into focused window instead of copying to clipboard (requires xdotool)")
+	fs.BoolVar(&cfg.SendEnter, "send-enter", cfg.SendEnter,
+		"Press Enter after delivering the text")
+	fs.StringVar(&cfg.Language, "language", cfg.Language,
+		"Force Whisper to decode in this language (e.g. 'en'). Auto-detect if empty.")
+	fs.IntVar(&cfg.Device, "device", cfg.Device,
+		"PortAudio input device index. Run --list-devices to list. -1 = default.")
+	fs.String("config", configPath,
+		"Path to TOML config file (default: ~/.config/whisper-stt/config.toml)")
+	fs.BoolVar(&cfg.listDevices, "list-devices", false,
+		"List available audio input devices and exit")
+
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			os.Exit(0)
+		}
+		return nil, err
+	}
+	return cfg, nil
+}
+
+// ---------------------------------------------------------------------------
+// Device listing
+// ---------------------------------------------------------------------------
+
+// listDevices returns a formatted string of available audio input devices.
+// It uses paDevices so tests can inject a fake device list.
+func listDevices() (string, error) {
+	devices, err := paDevices()
+	if err != nil {
+		return "", err
+	}
+	var sb strings.Builder
+	sb.WriteString("Available input devices:\n")
+	for i, d := range devices {
+		if d.MaxInputChannels > 0 {
+			fmt.Fprintf(&sb, "  [%d] %s\n", i, d.Name)
+		}
+	}
+	return sb.String(), nil
+}
+
+func mustListDevices() {
+	if err := portaudio.Initialize(); err != nil {
+		fmt.Fprintf(os.Stderr, "PortAudio init: %v\n", err)
+		os.Exit(1)
+	}
+	defer portaudio.Terminate()
+	out, err := listDevices()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "List devices: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Print(out)
+}
+
+// ---------------------------------------------------------------------------
+// Recorder
+// ---------------------------------------------------------------------------
+
+type recorder struct {
+	mu     sync.Mutex
+	frames []float32
+	active bool
+}
+
+func (r *recorder) isActive() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.active
+}
+
+func (r *recorder) start() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.frames = nil
+	r.active = true
+	fmt.Println("🎙  Recording…")
+}
+
+// append copies incoming samples into the buffer while recording is active.
+func (r *recorder) append(in []float32) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.active {
+		return
+	}
+	buf := make([]float32, len(in))
+	copy(buf, in)
+	r.frames = append(r.frames, buf...)
+}
+
+// stopAndGet atomically stops recording and returns the captured samples.
+// Returns (nil, false) if recording was not active, guarding against duplicate calls.
+func (r *recorder) stopAndGet() ([]float32, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.active {
+		return nil, false
+	}
+	r.active = false
+	result := make([]float32, len(r.frames))
+	copy(result, r.frames)
+	fmt.Println("⏹  Stopped. Transcribing…")
+	return result, true
+}
+
+// ---------------------------------------------------------------------------
+// WAV writing
+// ---------------------------------------------------------------------------
+
+// writeWAV writes float32 mono samples as a 16-bit PCM WAV file.
+func writeWAV(f *os.File, samples []float32, rate int) error {
+	dataSize := uint32(len(samples) * 2) // 16-bit = 2 bytes/sample
+
+	write16 := func(v uint16) { binary.Write(f, binary.LittleEndian, v) } //nolint:errcheck
+	write32 := func(v uint32) { binary.Write(f, binary.LittleEndian, v) } //nolint:errcheck
+
+	f.WriteString("RIFF")     //nolint:errcheck
+	write32(36 + dataSize)    // chunk size
+	f.WriteString("WAVEfmt ") //nolint:errcheck
+	write32(16)               // subchunk1 size (PCM)
+	write16(1)                // audio format: PCM
+	write16(1)                // channels: mono
+	write32(uint32(rate))     // sample rate
+	write32(uint32(rate * 2)) // byte rate
+	write16(2)                // block align
+	write16(16)               // bits per sample
+	f.WriteString("data")     //nolint:errcheck
+	write32(dataSize)
+
+	for _, s := range samples {
+		clamped := math.Max(-1.0, math.Min(1.0, float64(s)))
+		v := int16(clamped * 32767)
+		if err := binary.Write(f, binary.LittleEndian, v); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Transcription — delegates to an external whisper binary
+// ---------------------------------------------------------------------------
+
+// timestampRe strips leading "[HH:MM:SS.mmm --> HH:MM:SS.mmm]" from output lines.
+var timestampRe = regexp.MustCompile(`^\[[0-9:.,\s\->]+\]\s*`)
+
+// transcribe saves samples to a temp WAV, invokes the whisper binary,
+// and returns the transcribed text.
+func transcribe(samples []float32, cfg *config) (string, error) {
+	tmp, err := os.CreateTemp("", "whisper-stt-*.wav")
+	if err != nil {
+		return "", fmt.Errorf("create temp file: %w", err)
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+
+	if err := writeWAV(tmp, samples, sampleRate); err != nil {
+		tmp.Close()
+		return "", fmt.Errorf("write WAV: %w", err)
+	}
+	tmp.Close()
+
+	outDir, err := os.MkdirTemp("", "whisper-stt-out-*")
+	if err != nil {
+		return "", fmt.Errorf("create output dir: %w", err)
+	}
+	defer os.RemoveAll(outDir)
+
+	args := []string{
+		tmpPath,
+		"--model", cfg.Model,
+		"--output_format", "txt",
+		"--output_dir", outDir,
+	}
+	if cfg.Language != "" {
+		args = append(args, "--language", cfg.Language)
+	}
+
+	var stderr bytes.Buffer
+	cmd := newCmd(cfg.WhisperBin, args...)
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("whisper exited: %w\nstderr: %s", err, stderr.String())
+	}
+
+	// openai-whisper creates <basename>.txt in outDir
+	base := strings.TrimSuffix(filepath.Base(tmpPath), ".wav")
+	data, err := os.ReadFile(filepath.Join(outDir, base+".txt"))
+	if err != nil {
+		// Fallback: parse timestamp-prefixed lines from stderr (whisper.cpp style)
+		return parseTimestampedLines(stderr.String()), nil
+	}
+	return strings.TrimSpace(string(data)), nil
+}
+
+// parseTimestampedLines extracts text from lines like:
+// [00:00.000 --> 00:05.000]  Hello world.
+func parseTimestampedLines(output string) string {
+	var parts []string
+	for _, line := range strings.Split(output, "\n") {
+		line = timestampRe.ReplaceAllString(strings.TrimSpace(line), "")
+		if line != "" {
+			parts = append(parts, line)
+		}
+	}
+	return strings.TrimSpace(strings.Join(parts, " "))
+}
+
+// ---------------------------------------------------------------------------
+// Text delivery
+// ---------------------------------------------------------------------------
+
+func deliverText(text string, cfg *config) {
+	if cfg.TypeDirect {
+		typeText(text, cfg)
+		return
+	}
+	out := text
+	if cfg.SendEnter {
+		out += "\n"
+	}
+	if err := clipboardWrite(out); err != nil {
+		fmt.Fprintf(os.Stderr, "Clipboard error: %v\n", err)
+		return
+	}
+	fmt.Println("📋  Copied to clipboard.")
+}
+
+func typeText(text string, cfg *config) {
+	if _, err := lookPath("xdotool"); err != nil {
+		fmt.Fprintln(os.Stderr, "❌  xdotool not found. Install: sudo apt install xdotool")
+		clipboardWrite(text) //nolint:errcheck
+		fmt.Println("📋  Fell back to clipboard.")
+		return
+	}
+	newCmd("xdotool", "type", "--clearmodifiers", "--", text).Run() //nolint:errcheck
+	if cfg.SendEnter {
+		newCmd("xdotool", "key", "Return").Run() //nolint:errcheck
+	}
+	fmt.Println("⌨️  Typed into active window.")
+}
+
+// ---------------------------------------------------------------------------
+// Hotkey helpers
+// ---------------------------------------------------------------------------
+
+// parseComboKeys converts a pynput-style combo string to the slice of key name
+// strings understood by gohook, e.g. "<ctrl>+<alt>+r" → ["ctrl","alt","r"].
+func parseComboKeys(combo string) []string {
+	parts := strings.Split(combo, "+")
+	keys := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		p = strings.Trim(p, "<>")
+		p = strings.ToLower(p)
+		switch p {
+		case "cmd", "win":
+			p = "super"
+		case "control", "ctrl_l", "control_l":
+			p = "ctrl"
+		case "alt_l":
+			p = "alt"
+		case "shift_l":
+			p = "shift"
+		}
+		keys = append(keys, p)
+	}
+	return keys
+}
+
+// ---------------------------------------------------------------------------
+// Hotkey listeners
+// ---------------------------------------------------------------------------
+
+// handleSamples transcribes captured audio and delivers the resulting text.
+func handleSamples(samples []float32, cfg *config) {
+	if len(samples) == 0 {
+		fmt.Fprintln(os.Stderr, "⚠️  No audio captured.")
+		return
+	}
+	text, err := transcribe(samples, cfg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Transcription error: %v\n", err)
+		return
+	}
+	if text == "" {
+		fmt.Fprintln(os.Stderr, "⚠️  Nothing recognised.")
+		return
+	}
+	fmt.Printf("📝  %s\n", text)
+	deliverText(text, cfg)
+}
+
+// ---------------------------------------------------------------------------
+// Audio stream
+// ---------------------------------------------------------------------------
+
+// realOpenAudioStream is the live implementation of newAudioStream.
+func realOpenAudioStream(rec *recorder, cfg *config) (audioStream, error) {
+	callback := func(in []float32) { rec.append(in) }
+
+	if cfg.Device >= 0 {
+		devices, err := paDevices()
+		if err != nil {
+			return nil, fmt.Errorf("list devices: %w", err)
+		}
+		if cfg.Device >= len(devices) {
+			return nil, fmt.Errorf("device index %d out of range (have %d devices)",
+				cfg.Device, len(devices))
+		}
+		dev := devices[cfg.Device]
+		params := portaudio.StreamParameters{
+			Input: portaudio.StreamDeviceParameters{
+				Device:   dev,
+				Channels: 1,
+				Latency:  dev.DefaultLowInputLatency,
+			},
+			SampleRate:      float64(sampleRate),
+			FramesPerBuffer: framesPerBuffer,
+		}
+		return portaudio.OpenStream(params, callback)
+	}
+
+	return portaudio.OpenDefaultStream(1, 0, float64(sampleRate), framesPerBuffer, callback)
+}
+
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
+
+func main() {
+	cfg, err := loadConfig(os.Args[1:])
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+
+	if cfg.listDevices {
+		mustListDevices()
+		os.Exit(0)
+	}
+
+	if _, err := lookPath(cfg.WhisperBin); err != nil {
+		fmt.Fprintf(os.Stderr,
+			"Whisper binary %q not found on PATH. Install openai-whisper or set whisper_bin in config.\n",
+			cfg.WhisperBin)
+		os.Exit(1)
+	}
+	fmt.Printf("🔄  Using Whisper binary %q with model %q…\n", cfg.WhisperBin, cfg.Model)
+
+	if err := portaudio.Initialize(); err != nil {
+		fmt.Fprintf(os.Stderr, "PortAudio init: %v\n", err)
+		os.Exit(1)
+	}
+	defer portaudio.Terminate()
+
+	rec := &recorder{}
+
+	stream, err := newAudioStream(rec, cfg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Open audio stream: %v\n", err)
+		os.Exit(1)
+	}
+	if err := stream.Start(); err != nil {
+		fmt.Fprintf(os.Stderr, "Start audio stream: %v\n", err)
+		os.Exit(1)
+	}
+	defer stream.Stop()  //nolint:errcheck
+	defer stream.Close() //nolint:errcheck
+
+	keys := parseComboKeys(cfg.Hotkey)
+	triggerLabel := "Hold"
+	if cfg.Trigger == "toggle" {
+		triggerLabel = "Toggle with"
+	}
+	fmt.Printf("👂  %s [%s] to record. Ctrl-C to quit.\n\n", triggerLabel, cfg.Hotkey)
+
+	go func() {
+		if cfg.Trigger == "toggle" {
+			runToggleListener(rec, cfg, keys)
+		} else {
+			runHoldListener(rec, cfg, keys)
+		}
+	}()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	<-sigCh
+
+	fmt.Println("\n👋  Bye.")
+}

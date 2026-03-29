@@ -4,19 +4,16 @@ After=graphical-session.target
 PartOf=graphical-session.target
 
 [Service]
-# Adjust ExecStart path after 'uv run' — or use the full path to the venv entry-point.
-# Example with uv (recommended):
-# ExecStart=/usr/bin/env uv run --project %h/.config/whisper-stt whisper-stt --model base --hotkey "<ctrl>+<alt>+r"
-
-# Uncomment to type directly instead of clipboard:
-ExecStart=/usr/bin/env uv run --project /home/kazper/repos/claude-workspace/whisper-stt whisper-stt --type-direct --language en --hotkey '<alt_r>' --send-enter
-
+# Binary is installed to ~/.local/bin/ by install.sh.
+# All settings come from ~/.config/whisper-stt/config.toml — edit that file
+# rather than adding flags here.
+ExecStart=%h/.local/bin/whisper-stt
 Restart=on-failure
 RestartSec=3
 
-# Inherit the user's display so pynput and xdotool can see the X session
+# Inherit the user's display so gohook and xdotool can reach the X session.
 Environment=DISPLAY=:0
-# Wayland: set this too if on Wayland + XWayland
+# Uncomment if running on Wayland + XWayland:
 # Environment=WAYLAND_DISPLAY=wayland-0
 
 [Install]

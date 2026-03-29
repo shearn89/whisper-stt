@@ -1,0 +1,47 @@
+# whisper-stt configuration
+# Default location: ~/.config/whisper-stt/config.toml
+# All values shown are the built-in defaults.
+# Any setting can also be overridden at runtime with a CLI flag (see --help).
+
+# Whisper model size used for transcription.
+# Larger models are more accurate but slower to run.
+# Options: tiny, base, small, medium, large
+model = "base"
+
+# Path to the whisper binary.
+# "whisper"      — openai-whisper Python CLI (pip install openai-whisper)
+# "whisper-cli"  — whisper.cpp compiled binary
+# An absolute path is also accepted: whisper_bin = "/opt/whisper/bin/whisper"
+whisper_bin = "whisper"
+
+# Key combination that triggers recording.
+# Uses pynput syntax: modifier names in angle-brackets, joined with '+'.
+# Examples:
+#   hotkey = "<ctrl>+<alt>+r"
+#   hotkey = "<alt_r>"
+#   hotkey = "<super>+r"
+hotkey = "<ctrl>+<alt>+r"
+
+# How the hotkey activates recording.
+# "hold"   — recording runs while all keys are held; releasing stops it.
+# "toggle" — first press starts recording, second press stops + transcribes.
+trigger = "hold"
+
+# When true, the transcribed text is typed into the currently focused window
+# using xdotool instead of being placed on the clipboard.
+# Requires: sudo apt install xdotool
+type_direct = false
+
+# When true, a newline (clipboard) or Return keypress (type_direct) is sent
+# after the transcribed text is delivered.
+send_enter = false
+
+# Force Whisper to decode in a specific language.
+# Leave empty for automatic language detection.
+# Examples: "en", "de", "fr", "ja"
+language = ""
+
+# PortAudio input device index.
+# -1 uses the system default microphone.
+# Run  whisper-stt --list-devices  to see available device indices.
+device = -1
