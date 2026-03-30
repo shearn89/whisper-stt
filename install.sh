@@ -53,6 +53,23 @@ if [[ "${1:-}" == "uninstall" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
+# Install system dependencies
+# ---------------------------------------------------------------------------
+
+install_dependencies() {
+    info "Installing system dependencies…"
+    sudo apt install -y \
+        libx11-xcb1-dev \
+        libxkbcommon-dev \
+        libxkbcommon-x11-dev \
+        libxext-dev \
+        libxtst-dev \
+        portaudio19-dev \
+        xdotool \
+        ffmpeg
+}
+
+# ---------------------------------------------------------------------------
 # Install
 # ---------------------------------------------------------------------------
 
@@ -61,6 +78,9 @@ echo ""
 
 # Check prerequisites
 require_cmd go "install Go from https://go.dev/dl/"
+
+# Install system dependencies (best-effort — may require sudo password)
+install_dependencies || true
 
 # Must run from the project root (where go.mod lives)
 [[ -f go.mod ]] || die "Run this script from the project root (where go.mod is)"
