@@ -818,7 +818,7 @@ func TestListDevices_FormatsOutput(t *testing.T) {
 	paDevices = func() ([]*portaudio.DeviceInfo, error) {
 		return []*portaudio.DeviceInfo{
 			{Name: "Built-in Mic", MaxInputChannels: 1},
-			{Name: "HDMI Out", MaxInputChannels: 0},   // output-only, should be excluded
+			{Name: "HDMI Out", MaxInputChannels: 0},    // output-only, should be excluded
 			{Name: "USB Headset", MaxInputChannels: 2}, //nolint
 		}, nil
 	}

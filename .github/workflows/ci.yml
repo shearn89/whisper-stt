@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Go only. The -tags noX11 build swaps the gohook X11 listener for a stub
+# (hook_stub.go), so everything runs without an X server or libx11-dev, as
+# `make test` does. The legacy Python in src/ is not checked: its pynput ->
+# evdev dependency needs kernel headers to build.
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # go-version-file honours the toolchain line in go.mod (the patched Go).
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt check
+        run: test -z "$(gofmt -l *.go)" || { gofmt -l *.go; exit 1; }
+
+      - name: go vet
+        run: go vet -tags noX11 ./...
+
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck -tags noX11 ./...
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: go test -race
+        run: make test
