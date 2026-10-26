@@ -28,6 +28,8 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      # The audio capture package links PortAudio through cgo.
+      - run: sudo apt-get update -q && sudo apt-get install -y -q portaudio19-dev
 
       - name: gofmt check
         run: test -z "$(gofmt -l *.go)" || { gofmt -l *.go; exit 1; }
@@ -48,6 +50,7 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      - run: sudo apt-get update -q && sudo apt-get install -y -q portaudio19-dev
 
       - name: go test -race
         run: make test
